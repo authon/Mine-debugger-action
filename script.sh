@@ -67,7 +67,6 @@ stop_sshx() {
   return 0
 }
 trap stop_sshx EXIT
-cd "${HOME_PATH:-$HOME}" 2>/dev/null
 bash -i
 WRAPPER
 chmod +x "$SHELL_WRAPPER"
@@ -106,8 +105,8 @@ echo "#  在线 SSH 地址（浏览器直接打开，无需安装任何客户端
 echo "#"
 echo "#   ${SSH_URL}"
 echo "#"
-echo "#  打开后就是一个终端（默认已经在 openwrt 目录里）"
-echo "#      make menuconfig"
+echo "#  打开后就是一个终端，可以执行："
+echo "#      cd openwrt && make menuconfig"
 echo "#  配置完成、保存 .config 后，按 Ctrl+D（或输入 exit）就立刻继续编译；"
 echo "#  不结束的话，${TIMEOUT_MIN} 分钟后会自动继续。"
 echo "##############################################################"
@@ -119,7 +118,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     echo ""
     echo "浏览器打开：<${SSH_URL}>"
     echo ""
-    echo "打开后执行 \`make menuconfig\`（终端默认已在 openwrt 目录）；保存 \`.config\` 后按 \`Ctrl+D\` 继续编译。"
+    echo "打开后执行 \`cd openwrt && make menuconfig\`；保存 \`.config\` 后按 \`Ctrl+D\` 继续编译。"
   } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 fi
 
