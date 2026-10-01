@@ -7,7 +7,7 @@ Interactive debugger for GitHub Actions. The connection information can sent to 
 ```yml
     steps:
     - name: SSH远程连接
-      uses: authon/debugger-action@main
+      uses: authon/Mine-debugger-action@main
 ```
 
 ## Acknowledgments
