@@ -14,6 +14,11 @@
 #   SSHX_NAME           session name shown in the browser title
 #   INFORMATION_NOTICE  TG | PUSH -> also send the link through Telegram / PushPlus
 #   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PUSH_PLUS_TOKEN
+#
+# Ending the session: press Ctrl+D (or type exit) in the browser terminal. sshx keeps the
+# session alive after a shell closes, so the shell runs through a small wrapper that stops
+# sshx as soon as the shell ends -- this restores the old tmate behaviour, where Ctrl+D
+# continued the build immediately instead of waiting out the timeout.
 
 set -uo pipefail
 
@@ -46,11 +51,32 @@ if ! command -v sshx > /dev/null 2>&1; then
 fi
 echo "版本: $(sshx --version 2>&1 | head -1)"
 
-rm -f "$LOG"
+rm -f "$LOG" /tmp/sshx.pid
+
+# sshx tracks shells and sessions separately, so closing the shell leaves the session (and
+# the sshx process) running. Run the shell through this wrapper so that ending it -- Ctrl+D,
+# `exit`, anything -- also stops sshx, which is what makes the step continue right away.
+SHELL_WRAPPER="/tmp/sshx-shell.sh"
+cat > "$SHELL_WRAPPER" <<'WRAPPER'
+#!/bin/bash
+stop_sshx() {
+  if [[ -f /tmp/sshx.pid ]]; then
+    kill "$(cat /tmp/sshx.pid)" 2>/dev/null
+  fi
+  pkill -x sshx 2>/dev/null
+  return 0
+}
+trap stop_sshx EXIT
+cd "${HOME_PATH:-$HOME}" 2>/dev/null
+bash -i
+WRAPPER
+chmod +x "$SHELL_WRAPPER"
+
 # -q prints nothing but the link. The fragment after '#' is the end-to-end encryption key,
 # so the whole string has to be handed to the user unchanged.
-setsid sshx -q --name "${SSHX_NAME:-github-actions}" > "$LOG" 2>&1 < /dev/null &
+setsid sshx -q --name "${SSHX_NAME:-github-actions}" --shell "$SHELL_WRAPPER" > "$LOG" 2>&1 < /dev/null &
 SSHX_PID=$!
+echo "$SSHX_PID" > /tmp/sshx.pid
 
 SSH_URL=""
 for _ in $(seq 1 90); do
@@ -80,10 +106,10 @@ echo "#  在线 SSH 地址（浏览器直接打开，无需安装任何客户端
 echo "#"
 echo "#   ${SSH_URL}"
 echo "#"
-echo "#  打开后就是一个终端，可以执行："
-echo "#      cd openwrt && make menuconfig"
-echo "#  配置完成、保存 .config 后，在终端里输入 exit 即可继续编译；"
-echo "#  不输入 exit 的话，${TIMEOUT_MIN} 分钟后会自动继续。"
+echo "#  打开后就是一个终端（默认已经在 openwrt 目录里）"
+echo "#      make menuconfig"
+echo "#  配置完成、保存 .config 后，按 Ctrl+D（或输入 exit）就立刻继续编译；"
+echo "#  不结束的话，${TIMEOUT_MIN} 分钟后会自动继续。"
 echo "##############################################################"
 echo ""
 
@@ -93,7 +119,7 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     echo ""
     echo "浏览器打开：<${SSH_URL}>"
     echo ""
-    echo "打开后执行 \`cd openwrt && make menuconfig\`；保存 \`.config\` 后在终端输入 \`exit\` 继续编译。"
+    echo "打开后执行 \`make menuconfig\`（终端默认已在 openwrt 目录）；保存 \`.config\` 后按 \`Ctrl+D\` 继续编译。"
   } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 fi
 
@@ -108,8 +134,9 @@ elif [[ -n "${PUSH_PLUS_TOKEN:-}" ]] && [[ "${INFORMATION_NOTICE:-}" == "PUSH" ]
     --data "content=${SSH_URL}" "https://www.pushplus.plus/send" && echo " 完成" || echo " 失败"
 fi
 
-# Keep the session open until TIMEOUT_MIN elapses or the user types exit in the terminal
-# (which ends the shell, which ends sshx).
+# Keep the session open until TIMEOUT_MIN elapses, or until the user ends the shell in the
+# browser (Ctrl+D / exit). The wrapper above stops sshx at that moment, so this loop notices
+# immediately instead of waiting out the timeout.
 elapsed=0
 while kill -0 "$SSHX_PID" 2>/dev/null; do
   if (( elapsed >= timeout )); then
