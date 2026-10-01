@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 #=================================================
+# DEPRECATED - no longer called by script.sh.
+# Online SSH now uses sshx, because tmate.io stopped resolving in DNS, which made
+# `tmate ... wait tmate-ready` hang the build until the job timed out.
+#=================================================
 # Description: Install the latest version tmate
 # System Required: Debian/Ubuntu or other
 # Version: 1.0

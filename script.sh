@@ -1,191 +1,133 @@
 #!/bin/bash
+# Online SSH for the OpenWRT build workflows.
+#
+# This used to drive tmate. tmate.io is gone: the domain no longer publishes an A record
+# (Cloudflare DoH returns NOERROR with no answer), so `tmate ... wait tmate-ready` never
+# returns and the step hung until the job timed out. The session now runs on sshx
+# (https://sshx.io): a single static binary that opens a browser terminal, no account and
+# no SSH client needed.
+#
+# Environment variables understood here (same names as the old tmate version):
+#   TIMEOUT_MIN         how many minutes the session stays open (default 30)
+#   TIMEOUT_FAIL        1/true -> fail the step when the session times out instead of continuing
+#   SKIP_DEBUGGER       set to anything -> skip this step entirely
+#   SSHX_NAME           session name shown in the browser title
+#   INFORMATION_NOTICE  TG | PUSH -> also send the link through Telegram / PushPlus
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PUSH_PLUS_TOKEN
 
-set -eo pipefail
+set -uo pipefail
 
-uriencode() {
-  s="${1//'%'/%25}"
-  s="${s//' '/%20}"
-  s="${s//'"'/%22}"
-  s="${s//'#'/%23}"
-  s="${s//'$'/%24}"
-  s="${s//'&'/%26}"
-  s="${s//'+'/%2B}"
-  s="${s//','/%2C}"
-  s="${s//'/'/%2F}"
-  s="${s//':'/%3A}"
-  s="${s//';'/%3B}"
-  s="${s//'='/%3D}"
-  s="${s//'?'/%3F}"
-  s="${s//'@'/%40}"
-  s="${s//'['/%5B}"
-  s="${s//']'/%5D}"
-  printf %s "$s"
-}
+if [[ -n "${SKIP_DEBUGGER:-}" ]]; then
+  echo "SKIP_DEBUGGER is set, skipping the online SSH step"
+  exit 0
+fi
 
-# For mount docker volume, do not directly use '/tmp' as the dir
-TMATE_TERM="${TMATE_TERM:-screen-256color}"
-TIMESTAMP="$(date +%s%3N)"
-TMATE_DIR="/tmp/tmate-${TIMESTAMP}"
-TMATE_SOCK="${TMATE_DIR}/session.sock"
-TMATE_SESSION_NAME="tmate-${TIMESTAMP}"
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null 2>&1 && pwd )"
-# Shorten this URL to avoid mask by Github Actions Runner
-README_URL="https://github.com/tete1030/safe-debugger-action/blob/master/README.md"
-README_URL_SHORT="$(curl -si https://git.io -F "url=${README_URL}" | tr -d '\r' | sed -En 's/^Location: (.*)/\1/p')"
+TIMEOUT_MIN="${TIMEOUT_MIN:-30}"
+timeout=$(( TIMEOUT_MIN * 60 ))
+LOG="/tmp/sshx-session.log"
 
-cleanup() {
-  if [ -n "${container_id}" ] && [ "x${docker_type}" = "ximage" ]; then
-    echo "Current docker container will be saved to your image: ${TMATE_DOCKER_IMAGE_EXP}"
-    docker stop -t1 "${container_id}" > /dev/null
-    docker commit --message "Commit from safe-debugger-action" "${container_id}" "${TMATE_DOCKER_IMAGE_EXP}"
-    docker rm -f "${container_id}" > /dev/null
+echo "=============================================================="
+echo " 在线 SSH（sshx 网页终端）"
+echo "=============================================================="
+
+export PATH="$HOME/.local/bin:$PATH"
+if ! command -v sshx > /dev/null 2>&1; then
+  echo "正在安装 sshx ..."
+  if ! curl -sSf https://sshx.io/get | sh > /tmp/sshx-install.log 2>&1; then
+    echo "::error::sshx 安装失败"
+    tail -20 /tmp/sshx-install.log
+    exit 1
   fi
-  tmate -S "${TMATE_SOCK}" kill-server || true
-  sed -i '/alias attach_docker/d' ~/.bashrc || true
-  rm -rf "${TMATE_DIR}"
-}
-
-if [[ -n "$SKIP_DEBUGGER" ]]; then
-  echo "Skipping debugger because SKIP_DEBUGGER enviroment variable is set"
-  exit
+  export PATH="$HOME/.local/bin:$PATH"
 fi
-
-# Install tmate on macOS or Ubuntu
-echo Setting up tmate and openssl...
-if [ -x "$(command -v brew)" ]; then
-  brew install tmate > /tmp/brew.log
+if ! command -v sshx > /dev/null 2>&1; then
+  echo "::error::安装后仍找不到 sshx"
+  exit 1
 fi
-if [ -x "$(command -v apt-get)" ]; then
-  "${SCRIPT_DIR}/tmate.sh"
-fi
+echo "版本: $(sshx --version 2>&1 | head -1)"
 
-# Generate ssh key if needed
-[ -e ~/.ssh/id_rsa ] || ssh-keygen -t rsa -f ~/.ssh/id_rsa -q -N ""
+rm -f "$LOG"
+# -q prints nothing but the link. The fragment after '#' is the end-to-end encryption key,
+# so the whole string has to be handed to the user unchanged.
+setsid sshx -q --name "${SSHX_NAME:-github-actions}" > "$LOG" 2>&1 < /dev/null &
+SSHX_PID=$!
 
-# Run deamonized tmate
-echo Running tmate...
-
-now_date="$(date)"
-timeout=$(( ${TIMEOUT_MIN:=30}*60 ))
-kill_date="$(date -d "${now_date} + ${timeout} seconds")"
-
-TMATE_SESSION_PATH="$(pwd)"
-mkdir "${TMATE_DIR}"
-
-container_id=''
-if [ -n "${TMATE_DOCKER_IMAGE}" ] || [ -n "${TMATE_DOCKER_CONTAINER}" ]; then
-  if [ -n "${TMATE_DOCKER_CONTAINER}" ]; then
-    docker_type="container"
-    container_id="${TMATE_DOCKER_CONTAINER}"
-  else
-    docker_type="image"
-    if [ -z "${TMATE_DOCKER_IMAGE_EXP}" ]; then
-      TMATE_DOCKER_IMAGE_EXP="${TMATE_DOCKER_IMAGE}"
-    fi
-    echo "Creating docker container for running tmate"
-    container_id=$(docker create -t "${TMATE_DOCKER_IMAGE}")
-    docker start "${container_id}"
+SSH_URL=""
+for _ in $(seq 1 90); do
+  if [[ -s "$LOG" ]]; then
+    SSH_URL="$(grep -oE 'https://sshx\.io/s/[A-Za-z0-9]+#[A-Za-z0-9_-]+' "$LOG" | head -1)"
+    [[ -z "$SSH_URL" ]] && SSH_URL="$(tr -d '\r\n' < "$LOG" | head -c 200)"
   fi
-  DK_SHELL="docker exec -e TERM='${TMATE_TERM}' -it '${container_id}' /bin/bash -il"
-  DOCKER_MESSAGE_CMD='printf "This window is running in Docker '"${docker_type}"'.\nTo attach to Github Actions runner, exit current shell\nor create a new tmate window by \"Ctrl-b, c\"\n(This shortcut is only available when connecting through ssh)\n\n"'
-  FIRSTWIN_MESSAGE_CMD='printf "This window is now running in GitHub Actions runner.\nTo attach to your Docker '"${docker_type}"' again, use \"attach_docker\" command\n\n"'
-  SECWIN_MESSAGE_CMD='printf "The first window of tmate has already been attached to your Docker '"${docker_type}"'.\nThis window is running in GitHub Actions runner.\nTo attach to your Docker '"${docker_type}"' again, use \"attach_docker\" command\n\n"'
-  echo "unalias attach_docker 2>/dev/null || true ; alias attach_docker='${DK_SHELL}'" >> ~/.bashrc
-  (
-    cd "${TMATE_DIR}"
-    TERM="${TMATE_TERM}" tmate -v -S "${TMATE_SOCK}" new-session -s "${TMATE_SESSION_NAME}" -c "${TMATE_SESSION_PATH}" -d "/bin/bash --noprofile --norc -c '${DOCKER_MESSAGE_CMD} ; ${DK_SHELL} ; ${FIRSTWIN_MESSAGE_CMD} ; /bin/bash -li'" \; set-option default-command "/bin/bash --noprofile --norc -c '${SECWIN_MESSAGE_CMD} ; /bin/bash -li'" \; set-option default-terminal "${TMATE_TERM}"
-  )
-else
-  echo "unalias attach_docker 2>/dev/null || true" >> ~/.bashrc
-  (
-    cd "${TMATE_DIR}"
-    TERM="${TMATE_TERM}" tmate -v -S "${TMATE_SOCK}" new-session -s "${TMATE_SESSION_NAME}" -c "${TMATE_SESSION_PATH}" -d \; set-option default-terminal "${TMATE_TERM}"
-  )
-fi
+  [[ -n "$SSH_URL" ]] && break
+  if ! kill -0 "$SSHX_PID" 2>/dev/null; then
+    echo "::error::sshx 进程意外退出"
+    cat "$LOG"
+    exit 1
+  fi
+  sleep 1
+done
 
-tmate -S "${TMATE_SOCK}" wait tmate-ready
-TMATE_PID="$(tmate -S "${TMATE_SOCK}" display -p '#{pid}')"
-TMATE_SERVER_LOG="${TMATE_DIR}/tmate-server-${TMATE_PID}.log"
-if [ ! -f "${TMATE_SERVER_LOG}" ]; then
-  echo "::error::No server log found" >&2
-  echo "Files in TMATE_DIR:" >&2
-  ls -l "${TMATE_DIR}"
+if [[ -z "$SSH_URL" ]]; then
+  echo "::error::90 秒内没有拿到 sshx 连接地址"
+  cat "$LOG"
+  kill "$SSHX_PID" 2>/dev/null || true
   exit 1
 fi
 
+echo ""
+echo "##############################################################"
+echo "#  在线 SSH 地址（浏览器直接打开，无需安装任何客户端）"
+echo "#"
+echo "#   ${SSH_URL}"
+echo "#"
+echo "#  打开后就是一个终端，可以执行："
+echo "#      cd openwrt && make menuconfig"
+echo "#  配置完成、保存 .config 后，在终端里输入 exit 即可继续编译；"
+echo "#  不输入 exit 的话，${TIMEOUT_MIN} 分钟后会自动继续。"
+echo "##############################################################"
+echo ""
 
-SSH_LINE="$(tmate -S "${TMATE_SOCK}" display -p '#{tmate_ssh}' |cut -d ' ' -f2)"
-WEB_LINE="$(tmate -S "${TMATE_SOCK}" display -p '#{tmate_web}')"
-
-  MSG="SSH: ${SSH_LINE}\nWEB: ${WEB_LINE}"
-  echo -e "\e[32m  \e[0m"
-  echo -e " SSH：\e[32m ${SSH_LINE} \e[0m"
-  echo -e " Web：\e[33m ${WEB_LINE} \e[0m"
-  echo -e "\e[32m  \e[0m"
-  
-TIMEOUT_MESSAGE="如果您未连接SSH，则在${timeout}秒内自动跳过，要立即跳过此步骤，只需连接SSH并退出即可"
-echo -e "$TIMEOUT_MESSAGE"
-
-if [[ -n "$TELEGRAM_BOT_TOKEN" ]] && [[ -n "$TELEGRAM_CHAT_ID" ]] && [[ "$INFORMATION_NOTICE" == "TG" ]]; then
-  echo -n "Sending information to Telegram Bot......"
-  curl -k --data chat_id="${TELEGRAM_CHAT_ID}" --data "text=  Web: ${WEB_LINE}
-  
-  SSH: ${SSH_LINE}" "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage"
-elif [[ -n "$PUSH_PLUS_TOKEN" ]] && [[ "$INFORMATION_NOTICE" == "PUSH" ]]; then
-  echo -n "Sending information to pushplus......"
-  curl -k --data token=${PUSH_PLUS_TOKEN} --data title="SSH连接代码" --data "content=Web: ${WEB_LINE}
-  
-  SSH: ${SSH_LINE}" "http://www.pushplus.plus/send"
+if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
+  {
+    echo "### 在线 SSH"
+    echo ""
+    echo "浏览器打开：<${SSH_URL}>"
+    echo ""
+    echo "打开后执行 \`cd openwrt && make menuconfig\`；保存 \`.config\` 后在终端输入 \`exit\` 继续编译。"
+  } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
 fi
 
-echo ""
-echo ______________________________________________________________________________________________
-echo ""
+if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]] && [[ -n "${TELEGRAM_CHAT_ID:-}" ]] && [[ "${INFORMATION_NOTICE:-}" == "TG" ]]; then
+  echo -n "正在把地址发送到 Telegram ..."
+  curl -k -s -o /dev/null --data chat_id="${TELEGRAM_CHAT_ID}" \
+    --data "text=在线 SSH 地址：${SSH_URL}" \
+    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" && echo " 完成" || echo " 失败"
+elif [[ -n "${PUSH_PLUS_TOKEN:-}" ]] && [[ "${INFORMATION_NOTICE:-}" == "PUSH" ]]; then
+  echo -n "正在把地址发送到 PushPlus ..."
+  curl -k -s -o /dev/null --data token="${PUSH_PLUS_TOKEN}" --data title="在线SSH连接地址" \
+    --data "content=${SSH_URL}" "https://www.pushplus.plus/send" && echo " 完成" || echo " 失败"
+fi
 
-# Wait for connection to close or timeout
-display_int=${DISP_INTERVAL_SEC:=30}
-timecounter=0
-
-user_connected=0
-while [ -S "${TMATE_SOCK}" ]; do
-  connected=0
-  grep -qE '^[[:digit:]\.]+ A mate has joined' "${TMATE_SERVER_LOG}" && connected=1
-  if [ ${connected} -eq 1 ] && [ ${user_connected} -eq 0 ]; then
-    echo "你刚刚连接超时,现在已禁用"
-    user_connected=1
-  fi
-  if [ ${user_connected} -ne 1 ]; then
-    if (( timecounter > timeout )); then
-      echo "等待连接超时,现在跳过SSH此步骤"
-      cleanup
-
-      if [ "x$TIMEOUT_FAIL" = "x1" ] || [ "x$TIMEOUT_FAIL" = "xtrue" ]; then
-        exit 1
-      else
-        exit 0
-      fi
+# Keep the session open until TIMEOUT_MIN elapses or the user types exit in the terminal
+# (which ends the shell, which ends sshx).
+elapsed=0
+while kill -0 "$SSHX_PID" 2>/dev/null; do
+  if (( elapsed >= timeout )); then
+    echo "等待连接超时（${TIMEOUT_MIN} 分钟），现在跳过 SSH 此步骤"
+    kill "$SSHX_PID" 2>/dev/null || true
+    wait "$SSHX_PID" 2>/dev/null || true
+    if [[ "x${TIMEOUT_FAIL:-}" = "x1" ]] || [[ "x${TIMEOUT_FAIL:-}" = "xtrue" ]]; then
+      exit 1
     fi
+    exit 0
   fi
-
-  if (( timecounter % display_int == 0 )); then
-      echo "您可以使用SSH终端连接，或者使用网页直接连接"
-      echo "终端连接IP为SSH:后面的代码，网页连接直接点击Web后面的链接，然后以[ctrl+c]开始和[ctrl+d]结束"
-      echo "命令：cd openwrt && make menuconfig"
-      echo -e "\e[32m  \e[0m"
-      echo -e " SSH: \e[32m ${SSH_LINE} \e[0m"
-      echo -e " Web: \e[33m ${WEB_LINE} \e[0m"
-      echo -e "\e[32m  \e[0m"
-      
-     [ "x${user_connected}" != "x1" ] && (
-       echo -e "\n如果您还不连接SSH，\e[31m将在\e[0m $(( timeout-timecounter )) 秒内自动跳过"
-       echo "要立即跳过此步骤，只需连接SSH并正确退出即可"
-     )
-    echo ______________________________________________________________________________________________
+  if (( elapsed > 0 && elapsed % 60 == 0 )); then
+    echo "在线 SSH 中 ...（已等待 ${elapsed} 秒，剩余 $(( timeout - elapsed )) 秒）"
+    echo "地址：${SSH_URL}"
   fi
-
-  sleep 1
-  timecounter=$((timecounter+1))
+  sleep 5
+  elapsed=$(( elapsed + 5 ))
 done
 
-echo "The connection is terminated."
-cleanup
+echo "在线 SSH 会话已结束，继续编译"
+exit 0
